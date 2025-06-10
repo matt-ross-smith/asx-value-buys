@@ -1,0 +1,83 @@
+import yfinance as yf
+import pandas as pd
+import streamlit as st
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+@st.cache_data(show_spinner=False)
+def get_all_asx_tickers():
+    asx_url = "https://www.asx.com.au/asx/research/ASXListedCompanies.csv"
+    try:
+        response = pd.read_csv(asx_url, skiprows=1)
+        response.columns = ['Company', 'Ticker', 'Industry']
+        response['Ticker'] = response['Ticker'].str.strip().str.upper()
+        return response['Ticker'].dropna().unique().tolist()
+    except:
+        return []
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return round(rsi.iloc[-1], 2) if not rsi.empty else 'N/A'
+
+def get_stock_analysis(ticker):
+    stock_data = {'Ticker': ticker}
+    try:
+        full_ticker = f"{ticker}.AX"
+        stock = yf.Ticker(full_ticker)
+        info = stock.info
+        hist = stock.history(period="6mo")
+
+        if hist.empty:
+            return None
+
+        avg_price = hist['Close'].mean()
+        last_price = info.get('regularMarketPrice', None)
+        stock_data['Last Price'] = last_price
+        stock_data['6mo Avg Price'] = round(avg_price, 2)
+
+        try:
+            stock_data['Undervalued'] = last_price < avg_price
+        except:
+            stock_data['Undervalued'] = False
+
+        stock_data['RSI'] = calculate_rsi(hist['Close'])
+
+        return stock_data
+    except:
+        return None
+
+def fetch_undervalued_stocks(tickers):
+    results = []
+    progress = st.empty()
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(get_stock_analysis, ticker): ticker for ticker in tickers}
+        for i, future in enumerate(as_completed(futures)):
+            result = future.result()
+            if result:
+                results.append(result)
+            progress.progress((i + 1) / len(tickers))
+    df = pd.DataFrame(results)
+    df['RSI_numeric'] = pd.to_numeric(df['RSI'], errors='coerce')
+    filtered = df[(df['Undervalued'] == True) & (df['RSI_numeric'] < 40)]
+    return filtered.drop(columns=['RSI_numeric'])
+
+def main():
+    st.title("ASX Value Buys Screener")
+    st.markdown("### Criteria: Below 6mo Average Price and RSI < 40")
+
+    tickers = get_all_asx_tickers()
+    if not tickers:
+        st.error("Failed to load ASX tickers.")
+        return
+
+    if st.button("Run Value Screener"):
+        filtered = fetch_undervalued_stocks(tickers)
+        st.success(f"Found {len(filtered)} undervalued stocks.")
+        st.dataframe(filtered)
+        st.download_button("Download Results", filtered.to_csv(index=False), "value_buys.csv")
+
+if __name__ == "__main__":
+    main()
